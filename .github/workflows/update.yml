@@ -1,0 +1,143 @@
+name: Update Sources
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      MANIFEST_FILE: io.github.alper_han.crossmacro.yml
+      APP_REPO: https://github.com/alper-han/CrossMacro.git
+      APP_PROJECT: src/CrossMacro.UI.Linux/CrossMacro.UI.Linux.csproj
+      DOTNET_GENERATOR_URL: https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/dotnet/flatpak-dotnet-generator.py
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Apply external data checker updates
+        uses: docker://ghcr.io/flathub/flatpak-external-data-checker:latest
+        with:
+          args: --update --edit-only --never-fork ${{ env.MANIFEST_FILE }}
+
+      - name: Read SDK settings from manifest
+        run: |
+          set -euo pipefail
+
+          runtime_version="$(sed -nE "s/^runtime-version:[[:space:]]*'?([^']+)'?$/\1/p" "${MANIFEST_FILE}" | head -n1)"
+          dotnet_version="$(sed -nE "s/^[[:space:]]*-[[:space:]]*org\\.freedesktop\\.Sdk\\.Extension\\.dotnet([0-9]+)[[:space:]]*$/\1/p" "${MANIFEST_FILE}" | head -n1)"
+
+          if [ -z "${runtime_version}" ] || [ -z "${dotnet_version}" ]; then
+            echo "Could not parse runtime or dotnet SDK version from ${MANIFEST_FILE}."
+            exit 1
+          fi
+
+          echo "RUNTIME_VERSION=${runtime_version}" >> "$GITHUB_ENV"
+          echo "DOTNET_VERSION=${dotnet_version}" >> "$GITHUB_ENV"
+
+      - name: Resolve source tag and commit
+        run: |
+          set -euo pipefail
+
+          app_tag="$(awk '
+            /url:[[:space:]]*https:\/\/github.com\/alper-han\/CrossMacro\.git/ {found=1; next}
+            found && /^[[:space:]]*tag:/ {print $2; exit}
+          ' "${MANIFEST_FILE}" | tr -d "\"'")"
+
+          if [ -z "${app_tag}" ]; then
+            echo "Could not read source tag from ${MANIFEST_FILE}."
+            exit 1
+          fi
+
+          app_commit="$(git ls-remote "${APP_REPO}" "refs/tags/${app_tag}^{}" | awk '{print $1}' | head -n1)"
+          if [ -z "${app_commit}" ]; then
+            app_commit="$(git ls-remote "${APP_REPO}" "refs/tags/${app_tag}" | awk '{print $1}' | head -n1)"
+          fi
+
+          if [ -z "${app_commit}" ]; then
+            echo "Could not resolve commit for tag ${app_tag}."
+            exit 1
+          fi
+
+          echo "APP_TAG=${app_tag}" >> "$GITHUB_ENV"
+          echo "APP_COMMIT=${app_commit}" >> "$GITHUB_ENV"
+
+      - name: Sync manifest tag and commit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          manifest_path = pathlib.Path(os.environ["MANIFEST_FILE"])
+          app_tag = os.environ["APP_TAG"]
+          app_commit = os.environ["APP_COMMIT"]
+
+          text = manifest_path.read_text()
+          pattern = re.compile(
+              r"(?ms)(- type: git\s*\n\s*url:\s*https://github\.com/alper-han/CrossMacro\.git\s*\n\s*tag:\s*)([^\n]+)(\n\s*commit:\s*)([^\n]+)"
+          )
+          new_text, count = pattern.subn(rf"\1{app_tag}\3{app_commit}", text, count=1)
+
+          if count != 1:
+              raise SystemExit("Failed to update CrossMacro source block in manifest.")
+
+          manifest_path.write_text(new_text)
+          PY
+
+      - name: Install Flatpak SDK dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y flatpak
+          flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak --user install -y flathub "org.freedesktop.Sdk//${RUNTIME_VERSION}" "org.freedesktop.Sdk.Extension.dotnet${DOTNET_VERSION}//${RUNTIME_VERSION}"
+
+      - name: Regenerate nuget-sources.json
+        run: |
+          set -euo pipefail
+          rm -rf source flatpak-dotnet-generator.py
+
+          git clone --depth 1 --branch "${APP_TAG}" "${APP_REPO}" source
+          curl -L "${DOTNET_GENERATOR_URL}" -o flatpak-dotnet-generator.py
+
+          python3 flatpak-dotnet-generator.py \
+            --dotnet "${DOTNET_VERSION}" \
+            --freedesktop "${RUNTIME_VERSION}" \
+            --runtime linux-x64 linux-arm64 \
+            -- \
+            nuget-sources.json \
+            "source/${APP_PROJECT}"
+
+          rm -rf source flatpak-dotnet-generator.py
+
+      - name: Check for changes
+        id: changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          git status --short
+
+      - name: Create pull request
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto/update-sources
+          delete-branch: true
+          title: Update CrossMacro source and NuGet sources
+          commit-message: Update CrossMacro source and NuGet sources
+          body: |
+            Automated update:
+            - refreshed source tag/commit in `${{ env.MANIFEST_FILE }}`
+            - regenerated `nuget-sources.json` for `${{ env.RUNTIME_VERSION }}` and .NET `${{ env.DOTNET_VERSION }}`
