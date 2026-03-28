@@ -89,8 +89,8 @@ modules:
       # Main source from GitHub
       - type: git
         url: https://github.com/alper-han/CrossMacro.git
-        tag: v0.9.9
-        commit: b3dc6f2d8e3600fa56b5602f825af730c09b08f9
+        tag: v1.0.1
+        commit: f6f716be6e00cfd9353767240ad9e518001cbd51
         x-checker-data:
           type: git
           tag-pattern: ^v([\d.]+)$
