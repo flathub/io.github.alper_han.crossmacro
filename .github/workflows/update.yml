@@ -84,7 +84,7 @@ jobs:
           pattern = re.compile(
               r"(?ms)(- type: git\s*\n\s*url:\s*https://github\.com/alper-han/CrossMacro\.git\s*\n\s*tag:\s*)([^\n]+)(\n\s*commit:\s*)([^\n]+)"
           )
-          new_text, count = pattern.subn(rf"\1{app_tag}\3{app_commit}", text, count=1)
+          new_text, count = pattern.subn(rf"\g<1>{app_tag}\g<3>{app_commit}", text, count=1)
 
           if count != 1:
               raise SystemExit("Failed to update CrossMacro source block in manifest.")
