@@ -9,135 +9,171 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: update-sources
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MANIFEST_FILE: io.github.alper_han.crossmacro.yml
       APP_REPO: https://github.com/alper-han/CrossMacro.git
       APP_PROJECT: src/CrossMacro.UI.Linux/CrossMacro.UI.Linux.csproj
-      DOTNET_GENERATOR_URL: https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/dotnet/flatpak-dotnet-generator.py
+      TARGET_RIDS: linux-x64 linux-arm64
+      DOTNET_GENERATOR_URL: https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/de2225a6dee4818c1339b3cdbf29f90c471fcb7e/dotnet/flatpak-dotnet-generator.py
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install workflow dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak python3-yaml
 
       - name: Apply external data checker updates
         uses: docker://ghcr.io/flathub/flatpak-external-data-checker:latest
         with:
-          args: --update --edit-only --never-fork ${{ env.MANIFEST_FILE }}
+          args: --edit-only ${{ env.MANIFEST_FILE }}
 
-      - name: Read SDK settings from manifest
+      - name: Read updated manifest
         run: |
-          set -euo pipefail
-
-          runtime_version="$(sed -nE "s/^runtime-version:[[:space:]]*'?([^']+)'?$/\1/p" "${MANIFEST_FILE}" | head -n1)"
-          dotnet_version="$(sed -nE "s/^[[:space:]]*-[[:space:]]*org\\.freedesktop\\.Sdk\\.Extension\\.dotnet([0-9]+)[[:space:]]*$/\1/p" "${MANIFEST_FILE}" | head -n1)"
-
-          if [ -z "${runtime_version}" ] || [ -z "${dotnet_version}" ]; then
-            echo "Could not parse runtime or dotnet SDK version from ${MANIFEST_FILE}."
-            exit 1
-          fi
-
-          echo "RUNTIME_VERSION=${runtime_version}" >> "$GITHUB_ENV"
-          echo "DOTNET_VERSION=${dotnet_version}" >> "$GITHUB_ENV"
-
-      - name: Resolve source tag and commit
-        run: |
-          set -euo pipefail
-
-          app_tag="$(awk '
-            /url:[[:space:]]*https:\/\/github.com\/alper-han\/CrossMacro\.git/ {found=1; next}
-            found && /^[[:space:]]*tag:/ {print $2; exit}
-          ' "${MANIFEST_FILE}" | tr -d "\"'")"
-
-          if [ -z "${app_tag}" ]; then
-            echo "Could not read source tag from ${MANIFEST_FILE}."
-            exit 1
-          fi
-
-          app_commit="$(git ls-remote "${APP_REPO}" "refs/tags/${app_tag}^{}" | awk '{print $1}' | head -n1)"
-          if [ -z "${app_commit}" ]; then
-            app_commit="$(git ls-remote "${APP_REPO}" "refs/tags/${app_tag}" | awk '{print $1}' | head -n1)"
-          fi
-
-          if [ -z "${app_commit}" ]; then
-            echo "Could not resolve commit for tag ${app_tag}."
-            exit 1
-          fi
-
-          echo "APP_TAG=${app_tag}" >> "$GITHUB_ENV"
-          echo "APP_COMMIT=${app_commit}" >> "$GITHUB_ENV"
-
-      - name: Sync manifest tag and commit
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
+          /usr/bin/python3 - <<'PY'
           import os
-          import pathlib
           import re
+          from pathlib import Path
 
-          manifest_path = pathlib.Path(os.environ["MANIFEST_FILE"])
-          app_tag = os.environ["APP_TAG"]
-          app_commit = os.environ["APP_COMMIT"]
+          import yaml
 
-          text = manifest_path.read_text()
-          pattern = re.compile(
-              r"(?ms)(- type: git\s*\n\s*url:\s*https://github\.com/alper-han/CrossMacro\.git\s*\n\s*tag:\s*)([^\n]+)(\n\s*commit:\s*)([^\n]+)"
-          )
-          new_text, count = pattern.subn(rf"\g<1>{app_tag}\g<3>{app_commit}", text, count=1)
-
-          if count != 1:
-              raise SystemExit("Failed to update CrossMacro source block in manifest.")
-
-          manifest_path.write_text(new_text)
+          manifest = yaml.safe_load(Path(os.environ["MANIFEST_FILE"]).read_text(encoding="utf-8"))
+          module, = [module for module in manifest["modules"] if module["name"] == "crossmacro"]
+          source, = [source for source in module["sources"] if isinstance(source, dict)
+                     and source.get("type") == "git" and source.get("url") == os.environ["APP_REPO"]]
+          extension, = [extension for extension in manifest["sdk-extensions"]
+                        if re.fullmatch(r"org\.freedesktop\.Sdk\.Extension\.dotnet[0-9]+", extension)]
+          settings = {
+              "RUNTIME_VERSION": str(manifest["runtime-version"]),
+              "DOTNET_VERSION": extension.removeprefix("org.freedesktop.Sdk.Extension.dotnet"),
+              "APP_TAG": source["tag"],
+              "APP_COMMIT": source["commit"],
+          }
+          patterns = {
+              "RUNTIME_VERSION": r"[0-9]{2}\.[0-9]{2}",
+              "DOTNET_VERSION": r"[0-9]+",
+              "APP_TAG": r"v[0-9]+(?:\.[0-9]+)+",
+              "APP_COMMIT": r"[0-9a-f]{40}",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              for name, value in settings.items():
+                  if not isinstance(value, str) or not re.fullmatch(patterns[name], value):
+                      raise SystemExit(f"Invalid {name} in manifest: {value!r}")
+                  output.write(f"{name}={value}\n")
           PY
 
-      - name: Install Flatpak SDK dependencies
+      - name: Install Flatpak SDK
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y flatpak
           flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak --user install -y flathub "org.freedesktop.Sdk//${RUNTIME_VERSION}" "org.freedesktop.Sdk.Extension.dotnet${DOTNET_VERSION}//${RUNTIME_VERSION}"
 
       - name: Regenerate nuget-sources.json
         run: |
           set -euo pipefail
-          rm -rf source flatpak-dotnet-generator.py
-
+          update_dir="$(mktemp -d "${RUNNER_TEMP}/update-sources.XXXXXX")"
+          cd "$update_dir"
           git clone --depth 1 --branch "${APP_TAG}" "${APP_REPO}" source
-          curl -L "${DOTNET_GENERATOR_URL}" -o flatpak-dotnet-generator.py
-
-          python3 flatpak-dotnet-generator.py \
-            --dotnet "${DOTNET_VERSION}" \
-            --freedesktop "${RUNTIME_VERSION}" \
-            --runtime linux-x64 linux-arm64 \
-            -- \
-            nuget-sources.json \
-            "source/${APP_PROJECT}"
-
-          rm -rf source flatpak-dotnet-generator.py
-
-      - name: Check for changes
-        id: changes
-        run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ "$(git -C source rev-parse HEAD)" != "${APP_COMMIT}" ]; then
+            echo "The source tag no longer matches the manifest commit." >&2
+            exit 1
           fi
-          echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          git status --short
+          curl --fail --location --retry 3 "${DOTNET_GENERATOR_URL}" -o flatpak-dotnet-generator.py
+
+          # Avoid concurrent restores writing to the same project assets.
+          read -r -a target_rids <<< "$TARGET_RIDS"
+          for rid in "${target_rids[@]}"; do
+            python3 flatpak-dotnet-generator.py \
+              "${rid}.json" \
+              "source/${APP_PROJECT}" \
+              --runtime "$rid" \
+              --freedesktop "${RUNTIME_VERSION}" \
+              --dotnet "${DOTNET_VERSION}" \
+              --dotnet-args -p:CrossMacroPublishProfile=native-aot -p:Configuration=Release \
+              "-p:BaseIntermediateOutputPath=obj/${rid}/" \
+              --source https://api.nuget.org/v3/index.json \
+              --source "/usr/lib/sdk/dotnet${DOTNET_VERSION}/nuget/packages"
+          done
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          project = Path("source") / os.environ["APP_PROJECT"]
+          merged = {}
+          for rid in os.environ["TARGET_RIDS"].split():
+              sources = json.loads(Path(f"{rid}.json").read_text(encoding="utf-8"))
+              packages = {source["dest-filename"]: source for source in sources}
+              if not packages:
+                  raise SystemExit(f"{rid}: NuGet source generation produced no packages.")
+              output_dir = project.parent / "obj" / rid
+              graph = json.loads((output_dir / f"{project.name}.nuget.dgspec.json").read_text(encoding="utf-8"))
+              root_assets = json.loads((output_dir / "project.assets.json").read_text(encoding="utf-8"))
+              if not any(target.endswith(f"/{rid}") for target in root_assets["targets"]):
+                  raise SystemExit(f"{rid}: Restore did not produce assets for the requested runtime.")
+
+              # The official generator does not propagate restore failures. Check the
+              # actual restore graph, including referenced projects and SDK downloads.
+              for spec in graph["projects"].values():
+                  assets_path = Path(spec["restore"]["outputPath"]) / "project.assets.json"
+                  assets = json.loads(assets_path.read_text(encoding="utf-8"))
+                  for log in assets.get("logs", []):
+                      if log["level"].lower() == "error":
+                          raise SystemExit(f"{assets_path}: {log['message']}")
+                  for identity, library in assets["libraries"].items():
+                      if library["type"] == "package":
+                          filename = identity.lower().replace("/", ".") + ".nupkg"
+                          if filename not in packages:
+                              raise SystemExit(f"{rid}: Missing package: {identity}")
+                  for framework in assets["project"]["frameworks"].values():
+                      for dependency in framework.get("downloadDependencies", []):
+                          versions = {part.strip() for part in dependency["version"].strip("[]").split(",")}
+                          if len(versions) != 1:
+                              raise SystemExit(f"Unexpected SDK download version: {dependency}")
+                          version, = versions
+                          filename = f"{dependency['name']}.{version}.nupkg".lower()
+                          if filename not in packages:
+                              raise SystemExit(f"{rid}: Missing SDK package: {filename}")
+
+              for filename, source in packages.items():
+                  if filename in merged and merged[filename] != source:
+                      raise SystemExit(f"Conflicting NuGet sources for {filename}")
+                  merged[filename] = source
+
+          destination = Path(os.environ["GITHUB_WORKSPACE"]) / "nuget-sources.json"
+          destination.write_text(json.dumps([merged[key] for key in sorted(merged)], indent=4), encoding="utf-8")
+          print(f"Validated {len(merged)} packages for {os.environ['TARGET_RIDS']}.")
+          PY
 
       - name: Create pull request
-        if: steps.changes.outputs.has_changes == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
+          add-paths: |
+            ${{ env.MANIFEST_FILE }}
+            nuget-sources.json
           branch: auto/update-sources
           delete-branch: true
-          title: Update CrossMacro source and NuGet sources
-          commit-message: Update CrossMacro source and NuGet sources
+          title: Update CrossMacro to ${{ env.APP_TAG }}
+          commit-message: Update CrossMacro to ${{ env.APP_TAG }}
           body: |
-            Automated update:
-            - refreshed source tag/commit in `${{ env.MANIFEST_FILE }}`
-            - regenerated `nuget-sources.json` for `${{ env.RUNTIME_VERSION }}` and .NET `${{ env.DOTNET_VERSION }}`
+            Update CrossMacro to `${{ env.APP_TAG }}` (`${{ env.APP_COMMIT }}`).
+
+            - Refresh the source reference in `${{ env.MANIFEST_FILE }}`.
+            - Regenerate and validate Native AOT NuGet sources for Linux x64 and Arm64
+              using Freedesktop `${{ env.RUNTIME_VERSION }}` and .NET `${{ env.DOTNET_VERSION }}`.
